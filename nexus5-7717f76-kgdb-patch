@@ -1,0 +1,258 @@
+diff --git a/drivers/tty/serial/kgdboc.c b/drivers/tty/serial/kgdboc.c
+index 2b42a01..2ac25ff4 100644
+--- a/drivers/tty/serial/kgdboc.c
++++ b/drivers/tty/serial/kgdboc.c
+@@ -29,6 +29,7 @@ static struct kgdb_io		kgdboc_io_ops;
+ static int configured		= -1;
+ 
+ static char config[MAX_CONFIG_LEN];
++static int config_retry_time = 0;
+ static struct kparam_string kps = {
+ 	.string			= config,
+ 	.maxlen			= MAX_CONFIG_LEN,
+@@ -150,6 +151,29 @@ static void cleanup_kgdboc(void)
+ 		kgdb_unregister_io_module(&kgdboc_io_ops);
+ }
+ 
++
++static int kgdbretry_option_setup(char *opt)
++{
++	if (strlen(opt) > MAX_CONFIG_LEN) {
++		printk(KERN_ERR "kgdbretry: config string too long\n");
++		return -ENOSPC;
++	}
++	config_retry_time = simple_strtoul(opt, NULL, 10);
++
++	return 0;
++}
++
++__setup("kgdbretry=", kgdbretry_option_setup);
++
++static int configure_kgdboc(void);
++static void ttycheck_func(struct work_struct *work)
++{
++	config_retry_time = 0;
++	configure_kgdboc();
++}
++
++static DECLARE_DELAYED_WORK(ttycheck_work, ttycheck_func);
++
+ static int configure_kgdboc(void)
+ {
+ 	struct tty_driver *p;
+@@ -176,8 +200,15 @@ static int configure_kgdboc(void)
+ 		goto do_register;
+ 
+ 	p = tty_find_polling_driver(cptr, &tty_line);
+-	if (!p)
++	if (!p) {
++		printk(KERN_INFO "kgdb will retry in %d secs\n", config_retry_time);
++		if (config_retry_time > 0) {
++			INIT_DELAYED_WORK(&ttycheck_work, ttycheck_func);
++			schedule_delayed_work(&ttycheck_work, config_retry_time * HZ);
++			return -ENODEV;
++		}
+ 		goto noconfig;
++    }
+ 
+ 	cons = console_drivers;
+ 	while (cons) {
+@@ -203,6 +234,7 @@ do_register:
+ 	return 0;
+ 
+ noconfig:
++	printk(KERN_ERR "kgdb failed to initialise\n");
+ 	config[0] = 0;
+ 	configured = 0;
+ 	cleanup_kgdboc();
+@@ -325,5 +357,6 @@ module_init(init_kgdboc);
+ module_exit(cleanup_kgdboc);
+ module_param_call(kgdboc, param_set_kgdboc_var, param_get_string, &kps, 0644);
+ MODULE_PARM_DESC(kgdboc, "<serial_device>[,baud]");
++MODULE_PARM_DESC(kgdbretry, "<delay in seconds> before retrying tty");
+ MODULE_DESCRIPTION("KGDB Console TTY Driver");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/tty/serial/msm_serial_hs_lite.c b/drivers/tty/serial/msm_serial_hs_lite.c
+index 2f08461..b0ece50 100644
+--- a/drivers/tty/serial/msm_serial_hs_lite.c
++++ b/drivers/tty/serial/msm_serial_hs_lite.c
+@@ -772,6 +772,9 @@ static void msm_hsl_reset(struct uart_port *port)
+ 	msm_hsl_write(port, RESET_BREAK_INT, regmap[vid][UARTDM_CR]);
+ 	msm_hsl_write(port, RESET_CTS, regmap[vid][UARTDM_CR]);
+ 	msm_hsl_write(port, RFR_LOW, regmap[vid][UARTDM_CR]);
++
++	/* Disable DM modes */
++	msm_hsl_write(port, 0, regmap[vid][UARTDM_DMEN]);
+ }
+ 
+ static unsigned int msm_hsl_get_mctrl(struct uart_port *port)
+@@ -1306,6 +1309,140 @@ static void msm_hsl_power(struct uart_port *port, unsigned int state,
+ 	}
+ }
+ 
++#ifdef CONFIG_CONSOLE_POLL
++
++/* defines from msm_serial.h */
++#define UARTDM_DMEN_RX_SC_ENABLE BIT(5)
++#define UARTDM_DMEN_TX_SC_ENABLE BIT(4)
++
++#define UARTDM_RXFS_BUF_SHIFT	0x7
++#define UARTDM_RXFS_BUF_MASK	0x7
++
++// static int msm_poll_init(struct uart_port *port)
++// {
++// 	unsigned int vid;
++//
++// 	vid = UART_TO_MSM(port)->ver_id;
++//
++// 	/* Enable single character mode on RX FIFO */
++//     /* A later patch from David Boyd suggests this causes problems... */
++//     /*msm_hsl_write(port, UARTDM_DMEN_RX_SC_ENABLE, regmap[vid][UARTDM_DMEN]);*/
++//
++// 	return 0;
++// }
++
++static int msm_poll_get_char_dm(struct uart_port *port)
++{
++	int c;
++	static u32 slop;
++	static int count;
++	unsigned char *sp = (unsigned char *)&slop;
++    unsigned int vid;
++
++    vid = UART_TO_MSM(port)->ver_id;
++
++	/* Check if a previous read had more than one char */
++	if (count) {
++		c = sp[sizeof(slop) - count];
++		count--;
++	/* Or if FIFO is empty */
++	} else if (!(msm_hsl_read(port, regmap[vid][UARTDM_SR]) & UARTDM_SR_RXRDY_BMSK)) { /* bit 0  */
++		/*
++		 * If RX packing buffer has less than a word, force stale to
++		 * push contents into RX FIFO
++		 */
++		count = msm_hsl_read(port, regmap[vid][UARTDM_RXFS]);
++
++		count = (count >> UARTDM_RXFS_BUF_SHIFT) & UARTDM_RXFS_BUF_MASK;
++		if (count) {
++			msm_hsl_write(port, FORCE_STALE_EVENT, regmap[vid][UARTDM_CR]);
++			slop = msm_hsl_read(port, regmap[vid][UARTDM_RF]);
++			c = sp[0];
++			count--;
++
++            msm_hsl_write(port, RESET_STALE_INT, regmap[vid][UARTDM_CR]);
++            msm_hsl_write(port, 0xFF, regmap[vid][UARTDM_DMRX]);
++            msm_hsl_write(port, STALE_EVENT_ENABLE, regmap[vid][UARTDM_CR]);
++
++		} else {
++			c = NO_POLL_CHAR;
++		}
++	/* FIFO has a word */
++	} else {
++		slop = msm_hsl_read(port, regmap[vid][UARTDM_RF]);
++		c = sp[0];
++		count = sizeof(slop) - 1;
++	}
++
++	return c;
++}
++
++
++static int msm_poll_get_char(struct uart_port *port)
++{
++	u32 imr;
++	int c;
++	unsigned int vid;
++
++	vid = UART_TO_MSM(port)->ver_id;
++
++	/* Disable all interrupts */
++	imr = msm_hsl_read(port, regmap[vid][UARTDM_IMR]);
++	msm_hsl_write(port, 0, regmap[vid][UARTDM_IMR]);
++
++
++    c = msm_poll_get_char_dm(port);
++
++
++	/* Enable interrupts */
++	msm_hsl_write(port, imr, regmap[vid][UARTDM_IMR]);
++
++	return c;
++}
++
++static void reset_dm_count(struct uart_port *port, int count)
++{
++	unsigned int vid;
++
++	vid = UART_TO_MSM(port)->ver_id;
++
++    wait_for_xmitr(port);
++    msm_hsl_write(port, count, regmap[vid][UARTDM_NCF_TX]);
++    msm_hsl_read(port, regmap[vid][UARTDM_NCF_TX]);
++}
++
++static void msm_poll_put_char(struct uart_port *port, unsigned char c)
++{
++	u32 imr;
++	unsigned int vid;
++
++	vid = UART_TO_MSM(port)->ver_id;
++
++	/* Disable all interrupts */
++	imr = msm_hsl_read(port, regmap[vid][UARTDM_IMR]);
++	msm_hsl_write(port, 0, regmap[vid][UARTDM_IMR]);
++
++	/*if (msm_port->is_uartdm)*/
++		reset_dm_count(port, 1);
++
++	/* Wait until FIFO is empty */
++	while (!(msm_hsl_read(port, regmap[vid][UARTDM_SR]) & UARTDM_SR_TXRDY_BMSK))
++		cpu_relax();
++
++	/* Write a character */
++	msm_hsl_write(port, c, regmap[vid][UARTDM_TF]);
++
++	/* Wait until FIFO is empty */
++	while (!(msm_hsl_read(port, regmap[vid][UARTDM_SR]) & UARTDM_SR_TXRDY_BMSK))
++		cpu_relax();
++
++	/* Enable interrupts */
++	msm_hsl_write(port, imr, regmap[vid][UARTDM_IMR]);
++
++	return;
++}
++#endif
++
+ static struct uart_ops msm_hsl_uart_pops = {
+ 	.tx_empty = msm_hsl_tx_empty,
+ 	.set_mctrl = msm_hsl_set_mctrl,
+@@ -1324,6 +1461,11 @@ static struct uart_ops msm_hsl_uart_pops = {
+ 	.config_port = msm_hsl_config_port,
+ 	.verify_port = msm_hsl_verify_port,
+ 	.pm = msm_hsl_power,
++#ifdef CONFIG_CONSOLE_POLL
++	//.poll_init = msm_poll_init,
++	.poll_get_char	= msm_poll_get_char,
++	.poll_put_char	= msm_poll_put_char,
++#endif
+ };
+ 
+ static struct msm_hsl_port msm_hsl_uart_ports[] = {
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index a203472..5d6a19f 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -369,6 +369,7 @@ struct tty_driver *tty_find_polling_driver(char *name, int *line)
+ 	mutex_lock(&tty_mutex);
+ 	/* Search through the tty devices to look for a match */
+ 	list_for_each_entry(p, &tty_drivers, tty_drivers) {
++		pr_info("name: %s p->name: %s p->driver_name: %s\n", name, p->name, p->driver_name);
+ 		if (strncmp(name, p->name, len) != 0)
+ 			continue;
+ 		stp = str;
+@@ -3397,4 +3398,3 @@ int __init tty_init(void)
+ #endif
+ 	return 0;
+ }
+-
