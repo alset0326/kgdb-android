@@ -14,7 +14,7 @@ For background, please see associated blog post at http://www.contextis.com/reso
 0. Run ```make``` to build your kernel source.
 0. Create your boot image, passing console arguments (IMPORTENT!)
 
-     ```abootimg -u boot.img -k zImage-dtb -c 'console=ttyHSL0,115200,n8 androidboot.console=ttyHSL0 kgdboc=ttyHSL0,115200 kgdbretry=4 androidboot.hardware=hammerhead user_debug=31 maxcpus=2 msm_watchdog_v2.enable=0'```
+     ```abootimg -u boot.img -k zImage-dtb -c 'cmdline=console=ttyHSL0,115200,n8 androidboot.console=ttyHSL0 kgdboc=ttyHSL0,115200 kgdbretry=4 androidboot.hardware=hammerhead user_debug=31 maxcpus=2 msm_watchdog_v2.enable=0'```
      
 0. Boot your phone into the bootloader (```adb reboot bootloader```)
 0. Plug in your debug cable (see blog)
