@@ -10,7 +10,7 @@ For background, please see associated blog post at http://www.contextis.com/reso
 0. Download this repo
 0. Run ```git apply ./path/to/nexus5-7717f76-kgdb-patch``` to apply patch
 0. Run ```make hammerhead_defconfig``` to create .config file
-0. Copy .config from this repo to replace the one in the msm directory. Or you can Run ```make menuconfig``` to enable ```CONFIG_KGDB``` and ```CONFIG_KGDB_SERIAL_CONSOLE``` options
+0. Copy .config from this repo to replace the one in the msm directory. Or you can Run ```make menuconfig``` to enable ```CONFIG_KGDB``` and ```CONFIG_KGDB_SERIAL_CONSOLE``` options, modify option ```CONFIG_STRICT_MEMORY_RWX``` to n.
 0. Run ```make``` to build your kernel source.
 0. Create your boot image, passing console arguments (IMPORTENT!)
 
